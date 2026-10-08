@@ -1,0 +1,28 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Procedural Curves",
+	"Description": "Curves defined by formula instead of keys.",
+	"Category": "Animation",
+	"CreatedBy": "PsinaDev",
+	"CreatedByURL": "https://github.com/PsinaDev",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "ProceduralCurves",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "ProceduralCurvesEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}
