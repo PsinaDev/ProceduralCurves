@@ -17,6 +17,7 @@ public class ProceduralCurvesEditor : ModuleRules
 			new string[]
 			{
 				"CoreUObject",
+				"DeveloperSettings",
 				"Engine",
 				"Slate",
 				"SlateCore",

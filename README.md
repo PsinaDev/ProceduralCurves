@@ -4,7 +4,7 @@
 
 Formula-defined curves for Unreal Engine 5. Instead of keys, a curve is a stack of waveforms and math expressions, evaluated continuously at any time, from any thread, with live plots in the Details panel.
 
-![Damped spring expression](screenshots/ProceduralCurve_Spring.png)
+![Spring After Step preset](screenshots/ProceduralCurve_Spring.png)
 
 ## Overview
 
@@ -19,6 +19,7 @@ Typical uses: weapon sway and head bob, breathing idles, light flicker, UI pulse
 - Math expressions compiled to a stack program, with 40 functions, cached per distinct formula
 - Frame-rate independent playback: one full cycle every N seconds
 - Details panel customization: inline plots, a two-cycle preview with range labels and a loop-seam warning, live formula validation
+- Curve presets: around 50 built-in formulas, plus user presets shared through project settings
 - Thread-safe evaluation, no editor dependencies at runtime
 
 ## Installation
@@ -130,11 +131,11 @@ Division, modulo, `sqrt` and `log` with an invalid argument return 0 instead of 
 
 **Examples:**
 
-Decaying bounces:
+Decaying bounces, `abs(sine(1.5 * t)) * exp(-2 * t)` (the Bouncing Ball preset):
 
 ![Decaying bounces expression](screenshots/ProceduralCurve_Bounce.png)
 
-A sine with rare random glitches, `sine(x) + (hash(floor(x * 16), 7) > 0.85 ? (hash(floor(x * 16), 3) - 0.5) * 3 : 0)`:
+A sine with rare random glitches, `sine(x) + (hash(floor(x * 16), 7) > 0.85 ? (hash(floor(x * 16), 3) - 0.5) * 3 : 0)` (the Glitch preset):
 
 ![Glitch expression](screenshots/ProceduralCurve_Glitch.png)
 
@@ -146,8 +147,10 @@ A sine with rare random glitches, `sine(x) + (hash(floor(x * 16), 7) > 0.85 ? (h
 - **Term header:** enable toggle, waveform, blend, a sparkline and a one-line summary (`A 0.4   f 2   310°`)
 - **Term body:** only the parameters of the selected waveform
 - **Formula field:** multi-line, validated as you type, full function reference on hover
+- **Presets:** the star button with the name of the matching preset in the curve header, arrows on either side
+- **Reset to default:** on every curve and term field, including terms added after the defaults and the formula field
 
-A single sine term:
+A single sine term, matching no preset:
 
 ![Sine curve in the Details panel](screenshots/ProceduralCurve_Sine.png)
 
@@ -155,9 +158,22 @@ A vector curve with X, Y and Z phase-shifted:
 
 ![Vector curve in the Details panel](screenshots/ProceduralVectorCurve_Sine.png)
 
-A rotator curve, legend taken from the Roll, Pitch and Yaw members:
+A rotator curve with a preset on each axis, legend taken from the Roll, Pitch and Yaw members:
 
 ![Rotator curve in the Details panel](screenshots/ProceduralRotator.png)
+
+### Presets
+
+The star button in every curve header opens the presets menu. Next to it is the name of the preset the curve matches, or Custom once it has been edited. Applying a preset replaces the whole curve (terms, offset and clamp) as one undoable change.
+
+- **Built-in:** around 50 single-formula curves, grouped by category: Steps, Breathing, Noise, Modulation, Physics, Accents and One-Shot. The tooltip shows the formula. Everything except One-Shot loops seamlessly over a cycle
+- **Save as Preset...:** stores the current curve under a name, with an optional category and description
+- **User:** saved presets, each with Apply and Delete. A user preset with the name of a built-in one takes its place
+- **Arrows:** apply the previous or next preset, built-in first, then user. A curve that matches no preset starts from the first or the last one
+
+User presets live in **Project Settings → Plugins → Procedural Curve Presets** and are written to `Config/DefaultEditor.ini`, so they reach the whole team through source control.
+
+![Presets menu](screenshots/ProceduralCurve_Presets.png)
 
 ## Architecture
 

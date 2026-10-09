@@ -138,7 +138,7 @@ int32 SProceduralCurvePreview::OnPaint(const FPaintArgs& Args, const FGeometry& 
 		bool bSeam = false;
 		for (const FProceduralCurvePreviewSeries& Entry : Series)
 		{
-			if (Entry.Sample && FMath::Abs(Entry.Sample(1.0f - 1.0e-3f) - Entry.Sample(0.0f)) > 0.02f * (Max - Min))
+			if (Entry.Sample && FMath::Abs(Entry.Sample(1.0f - KINDA_SMALL_NUMBER) - Entry.Sample(0.0f)) > 0.02f * (Max - Min))
 			{
 				bSeam = true;
 				break;

@@ -4,11 +4,22 @@
 #include "DetailLayoutBuilder.h"
 #include "DetailWidgetRow.h"
 #include "IDetailChildrenBuilder.h"
+#include "IDetailPropertyRow.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Framework/MultiBox/MultiBoxBuilder.h"
+#include "Misc/MessageDialog.h"
 #include "ProceduralCurve.h"
+#include "ProceduralCurvePresets.h"
 #include "ProceduralExpression.h"
 #include "PropertyHandle.h"
 #include "SProceduralCurvePreview.h"
+#include "Styling/AppStyle.h"
+#include "Widgets/Images/SImage.h"
+#include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SComboButton.h"
+#include "Widgets/Input/SEditableTextBox.h"
 #include "Widgets/Input/SMultiLineEditableTextBox.h"
+#include "Widgets/SWindow.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Text/STextBlock.h"
@@ -113,6 +124,435 @@ namespace
 		}
 		return FText::FromString(Help.TrimEnd());
 	}
+
+	/**
+	 * True when an enclosing array element has no counterpart in the defaults: the engine then reports the element as changed
+	 * and none of its members, so members get no reset arrow of their own.
+	 */
+	bool IsMissingFromDefaults(const TSharedPtr<IPropertyHandle>& Handle)
+	{
+		for (TSharedPtr<IPropertyHandle> Node = Handle; Node.IsValid(); Node = Node->GetParentHandle())
+		{
+			if (Node->GetIndexInArray() == INDEX_NONE || !Node->DiffersFromDefault())
+			{
+				continue;
+			}
+
+			uint32 NumChildren = 0;
+			Node->GetNumChildren(NumChildren);
+			bool bAnyChildDiffers = false;
+			for (uint32 Index = 0; Index < NumChildren && !bAnyChildDiffers; ++Index)
+			{
+				const TSharedPtr<IPropertyHandle> Child = Node->GetChildHandle(Index);
+				bAnyChildDiffers = Child.IsValid() && Child->DiffersFromDefault();
+			}
+			if (NumChildren > 0 && !bAnyChildDiffers)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * True when an edited object's archetype lacks the top-level property, so the engine has nothing to compare against;
+	 * e.g. the Default Value of a Blueprint variable, edited on the class default object whose archetype is the parent's.
+	 */
+	bool HasNoArchetypeValue(const TSharedPtr<IPropertyHandle>& Handle)
+	{
+		// The top of the chain can be the object node, which has no property.
+		TSharedPtr<IPropertyHandle> Root = Handle;
+		for (TSharedPtr<IPropertyHandle> Parent = Root->GetParentHandle(); Parent.IsValid() && Parent->GetProperty(); Parent = Parent->GetParentHandle())
+		{
+			Root = Parent;
+		}
+
+		const FProperty* RootProperty = Root->GetProperty();
+		const UClass* OwnerClass = RootProperty ? RootProperty->GetOwnerClass() : nullptr;
+		if (!OwnerClass)
+		{
+			return false;
+		}
+
+		TArray<UObject*> Outers;
+		Handle->GetOuterObjects(Outers);
+		for (const UObject* Outer : Outers)
+		{
+			const UObject* Archetype = Outer ? Outer->GetArchetype() : nullptr;
+			if (!Archetype || !Archetype->IsA(OwnerClass))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Engine reset where the engine has a default; inside array elements missing from the defaults, the value of a
+	 * default-constructed TOwner instead.
+	 */
+	template<typename TOwner>
+	FResetToDefaultOverride MakeMemberResetOverride()
+	{
+		auto GetTypeDefault = [](const FProperty* Property) -> const void*
+		{
+			static const TOwner Default;
+			return Property->ContainerPtrToValuePtr<void>(&Default);
+		};
+
+		auto DiffersFromTypeDefault = [GetTypeDefault](const TSharedPtr<IPropertyHandle>& Handle)
+		{
+			const FProperty* Property = Handle->GetProperty();
+			TArray<void*> RawData;
+			Handle->AccessRawData(RawData);
+			for (const void* Raw : RawData)
+			{
+				if (Raw && !Property->Identical(Raw, GetTypeDefault(Property)))
+				{
+					return true;
+				}
+			}
+			return false;
+		};
+
+		return FResetToDefaultOverride::Create(
+			FIsResetToDefaultVisible::CreateLambda([DiffersFromTypeDefault](TSharedPtr<IPropertyHandle> Handle)
+			{
+				if (!Handle.IsValid() || !Handle->IsValidHandle() || !Handle->GetProperty())
+				{
+					return false;
+				}
+				return Handle->DiffersFromDefault()
+					|| ((HasNoArchetypeValue(Handle) || IsMissingFromDefaults(Handle)) && DiffersFromTypeDefault(Handle));
+			}),
+			FResetToDefaultHandler::CreateLambda([GetTypeDefault](TSharedPtr<IPropertyHandle> Handle)
+			{
+				if (!Handle.IsValid() || !Handle->IsValidHandle() || !Handle->GetProperty())
+				{
+					return;
+				}
+				if (Handle->DiffersFromDefault())
+				{
+					Handle->ResetToDefault();
+					return;
+				}
+
+				const FProperty* Property = Handle->GetProperty();
+				FString Text;
+				Property->ExportText_Direct(Text, GetTypeDefault(Property), nullptr, nullptr, PPF_None);
+				Handle->SetValueFromFormattedString(Text);
+			}));
+	}
+
+	/**
+	 * Override acting on Handle for a custom row with no property handle of its own; listing the handle on the row instead
+	 * makes the details view evaluate the property's EditCondition, which fails outside the property's own row.
+	 */
+	FResetToDefaultOverride BindResetOverride(const FResetToDefaultOverride& Override, const TSharedPtr<IPropertyHandle>& Handle)
+	{
+		const FResetToDefaultHandler OnReset = Override.GetPropertyResetToDefaultDelegate();
+		return FResetToDefaultOverride::Create(
+			TAttribute<bool>::CreateLambda([Override, Handle]() { return Override.IsResetToDefaultVisible(Handle); }),
+			FSimpleDelegate::CreateLambda([OnReset, Handle]() { OnReset.ExecuteIfBound(Handle); }));
+	}
+
+	void ApplyPreset(TSharedPtr<IPropertyHandle> Handle, FString PresetName)
+	{
+		FProceduralCurvePresetData Preset;
+		if (Handle.IsValid() && Handle->IsValidHandle() && ProceduralCurvePresets::Find(PresetName, Preset))
+		{
+			ProceduralCurvePresets::Apply(*Handle, Preset);
+		}
+	}
+
+	void ShowSaveAsPresetDialog(TSharedPtr<IPropertyHandle> Handle)
+	{
+		const FProceduralCurve* Curve = GetFirstRaw<FProceduralCurve>(Handle);
+		if (!Curve)
+		{
+			return;
+		}
+		const FProceduralCurve CurveCopy = *Curve;
+
+		TSharedRef<SWindow> Window = SNew(SWindow)
+			.Title(LOCTEXT("SavePresetTitle", "Save as Preset"))
+			.SizingRule(ESizingRule::UserSized)
+			.ClientSize(FVector2D(400, 210))
+			.SupportsMaximize(false)
+			.SupportsMinimize(false);
+		const TWeakPtr<SWindow> WeakWindow = Window;
+
+		TSharedPtr<SEditableTextBox> NameBox;
+		TSharedPtr<SEditableTextBox> CategoryBox;
+		TSharedPtr<SEditableTextBox> DescriptionBox;
+
+		auto CloseWindow = [WeakWindow]()
+		{
+			if (const TSharedPtr<SWindow> Pinned = WeakWindow.Pin())
+			{
+				Pinned->RequestDestroyWindow();
+			}
+			return FReply::Handled();
+		};
+
+		Window->SetContent(
+			SNew(SVerticalBox)
+			+ SVerticalBox::Slot().AutoHeight().Padding(10.0f, 10.0f, 10.0f, 4.0f)
+			[
+				SNew(STextBlock).Text(LOCTEXT("PresetName", "Preset Name:"))
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(10.0f, 0.0f)
+			[
+				SAssignNew(NameBox, SEditableTextBox).HintText(LOCTEXT("EnterPresetName", "Enter preset name..."))
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(10.0f, 8.0f, 10.0f, 4.0f)
+			[
+				SNew(STextBlock).Text(LOCTEXT("PresetCategory", "Category (optional):"))
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(10.0f, 0.0f)
+			[
+				SAssignNew(CategoryBox, SEditableTextBox).HintText(LOCTEXT("EnterCategory", "Enter category..."))
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(10.0f, 8.0f, 10.0f, 4.0f)
+			[
+				SNew(STextBlock).Text(LOCTEXT("PresetDescription", "Description (optional):"))
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(10.0f, 0.0f)
+			[
+				SAssignNew(DescriptionBox, SEditableTextBox).HintText(LOCTEXT("EnterDescription", "Enter description..."))
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(10.0f)
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().FillWidth(1.0f)
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("Save", "Save"))
+					.HAlign(HAlign_Center)
+					.OnClicked_Lambda([CurveCopy, NameBox, CategoryBox, DescriptionBox, CloseWindow]()
+					{
+						const FString Name = NameBox->GetText().ToString().TrimStartAndEnd();
+						if (Name.IsEmpty())
+						{
+							return FReply::Handled();
+						}
+
+						FProceduralCurvePresetData Existing;
+						if (ProceduralCurvePresets::Find(Name, Existing))
+						{
+							const FText Message = FText::Format(LOCTEXT("PresetExists", "Preset '{0}' already exists. Overwrite?"), FText::FromString(Name));
+							if (FMessageDialog::Open(EAppMsgType::YesNo, Message) != EAppReturnType::Yes)
+							{
+								return FReply::Handled();
+							}
+						}
+
+						ProceduralCurvePresets::SaveUser(Name, CategoryBox->GetText().ToString().TrimStartAndEnd(), DescriptionBox->GetText().ToString(), CurveCopy);
+						return CloseWindow();
+					})
+				]
+				+ SHorizontalBox::Slot().FillWidth(1.0f)
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("PresetSaveCancel", "Cancel"))
+					.HAlign(HAlign_Center)
+					.OnClicked_Lambda([CloseWindow]() { return CloseWindow(); })
+				]
+			]);
+
+		FSlateApplication::Get().AddModalWindow(Window, nullptr);
+	}
+
+	void DeletePreset(FString PresetName)
+	{
+		const FText Message = FText::Format(LOCTEXT("ConfirmDeletePreset", "Delete preset '{0}'?"), FText::FromString(PresetName));
+		if (FMessageDialog::Open(EAppMsgType::YesNo, Message) == EAppReturnType::Yes)
+		{
+			ProceduralCurvePresets::DeleteUser(PresetName);
+		}
+	}
+
+	/** Presets in their category submenus, uncategorized ones directly in the section. */
+	void AddPresetEntries(FMenuBuilder& MenuBuilder, const TArray<FProceduralCurvePresetData>& Presets, TFunction<void(FMenuBuilder&, const FProceduralCurvePresetData&)> AddEntry)
+	{
+		TArray<FString> Categories;
+		for (const FProceduralCurvePresetData& Preset : Presets)
+		{
+			if (Preset.Category.IsEmpty())
+			{
+				AddEntry(MenuBuilder, Preset);
+			}
+			else
+			{
+				Categories.AddUnique(Preset.Category);
+			}
+		}
+
+		for (const FString& Category : Categories)
+		{
+			MenuBuilder.AddSubMenu(
+				FText::FromString(Category),
+				FText::GetEmpty(),
+				FNewMenuDelegate::CreateLambda([Presets, Category, AddEntry](FMenuBuilder& SubMenuBuilder)
+				{
+					for (const FProceduralCurvePresetData& Preset : Presets)
+					{
+						if (Preset.Category == Category)
+						{
+							AddEntry(SubMenuBuilder, Preset);
+						}
+					}
+				}));
+		}
+	}
+
+	FText MakePresetTooltip(const FProceduralCurvePresetData& Preset)
+	{
+		const FProceduralCurveTerm* Term = Preset.Curve.Terms.Num() == 1 ? &Preset.Curve.Terms[0] : nullptr;
+		const bool bSingleExpression = Term && Term->Waveform == EProceduralWaveform::Expression;
+		return FText::FromString(bSingleExpression ? FString::Printf(TEXT("%s\n\n%s"), *Preset.Description, *Term->Expression).TrimStartAndEnd() : Preset.Description);
+	}
+
+	TSharedRef<SWidget> GeneratePresetsMenu(TSharedPtr<IPropertyHandle> Handle)
+	{
+		FMenuBuilder MenuBuilder(true, nullptr);
+
+		MenuBuilder.AddMenuEntry(
+			LOCTEXT("SaveAsPreset", "Save as Preset..."),
+			LOCTEXT("SaveAsPresetTooltip", "Store this curve as a reusable preset in the project settings"),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Save"),
+			FUIAction(FExecuteAction::CreateLambda([Handle]() { ShowSaveAsPresetDialog(Handle); })));
+
+		MenuBuilder.BeginSection("BuiltInPresets", LOCTEXT("BuiltInPresets", "Built-in"));
+		AddPresetEntries(MenuBuilder, ProceduralCurvePresets::GetBuiltIn(), [Handle](FMenuBuilder& Builder, const FProceduralCurvePresetData& Preset)
+		{
+			const FString PresetName = Preset.PresetName;
+			Builder.AddMenuEntry(
+				FText::FromString(PresetName),
+				MakePresetTooltip(Preset),
+				FSlateIcon(),
+				FUIAction(FExecuteAction::CreateLambda([Handle, PresetName]() { ApplyPreset(Handle, PresetName); })));
+		});
+		MenuBuilder.EndSection();
+
+		const TArray<FProceduralCurvePresetData> UserPresets = ProceduralCurvePresets::GetUser();
+		if (UserPresets.Num() > 0)
+		{
+			MenuBuilder.BeginSection("UserPresets", LOCTEXT("UserPresets", "User"));
+			AddPresetEntries(MenuBuilder, UserPresets, [Handle](FMenuBuilder& Builder, const FProceduralCurvePresetData& Preset)
+			{
+				const FString PresetName = Preset.PresetName;
+				Builder.AddSubMenu(
+					FText::FromString(PresetName),
+					MakePresetTooltip(Preset),
+					FNewMenuDelegate::CreateLambda([Handle, PresetName](FMenuBuilder& SubMenuBuilder)
+					{
+						SubMenuBuilder.AddMenuEntry(
+							LOCTEXT("ApplyPreset", "Apply"),
+							LOCTEXT("ApplyPresetTooltip", "Replace the curve with this preset"),
+							FSlateIcon(),
+							FUIAction(FExecuteAction::CreateLambda([Handle, PresetName]() { ApplyPreset(Handle, PresetName); })));
+						SubMenuBuilder.AddMenuEntry(
+							LOCTEXT("DeletePreset", "Delete"),
+							LOCTEXT("DeletePresetTooltip", "Remove this preset from the project settings"),
+							FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Delete"),
+							FUIAction(FExecuteAction::CreateLambda([PresetName]() { DeletePreset(PresetName); })));
+					}),
+					false,
+					FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Star"));
+			});
+			MenuBuilder.EndSection();
+		}
+
+		return MenuBuilder.MakeWidget();
+	}
+
+	TSharedRef<SWidget> MakeStepButton(TSharedPtr<IPropertyHandle> Handle, int32 Direction)
+	{
+		return SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+			.ContentPadding(FMargin(1.0f, 0.0f))
+			.ToolTipText(Direction < 0
+				? LOCTEXT("PreviousPresetTooltip", "Apply the previous preset")
+				: LOCTEXT("NextPresetTooltip", "Apply the next preset"))
+			.OnClicked_Lambda([Handle, Direction]()
+			{
+				if (Handle.IsValid() && Handle->IsValidHandle())
+				{
+					ProceduralCurvePresets::Step(*Handle, Direction);
+				}
+				return FReply::Handled();
+			})
+			[
+				SNew(SImage)
+				.Image(FAppStyle::GetBrush(Direction < 0 ? "Icons.ChevronLeft" : "Icons.ChevronRight"))
+				.ColorAndOpacity(FSlateColor::UseForeground())
+			];
+	}
+
+	TSharedRef<SWidget> MakePresetsButton(TSharedPtr<IPropertyHandle> Handle)
+	{
+		return SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			[
+				MakeStepButton(Handle, -1)
+			]
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			[
+				SNew(SComboButton)
+				.ComboButtonStyle(FAppStyle::Get(), "SimpleComboButton")
+				.HasDownArrow(false)
+				.ToolTipText(LOCTEXT("PresetsTooltip", "Apply a built-in or user preset, or save this curve as one"))
+				.OnGetMenuContent_Lambda([Handle]() { return GeneratePresetsMenu(Handle); })
+				.ButtonContent()
+				[
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.VAlign(VAlign_Center)
+					[
+						SNew(SImage)
+						.Image(FAppStyle::GetBrush("Icons.Star"))
+						.ColorAndOpacity(FSlateColor::UseForeground())
+					]
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.VAlign(VAlign_Center)
+					.Padding(4.0f, 0.0f, 0.0f, 0.0f)
+					[
+						SNew(SBox)
+						.MaxDesiredWidth(140.0f)
+						[
+							SNew(STextBlock)
+							.Font(IDetailLayoutBuilder::GetDetailFont())
+							.OverflowPolicy(ETextOverflowPolicy::Ellipsis)
+							.Text_Lambda([Handle]()
+							{
+								const FProceduralCurve* Curve = GetFirstRaw<FProceduralCurve>(Handle);
+								const FString Name = Curve ? ProceduralCurvePresets::FindMatchingName(*Curve) : FString();
+								return Name.IsEmpty() ? LOCTEXT("CustomCurve", "Custom") : FText::FromString(Name);
+							})
+							.ColorAndOpacity_Lambda([Handle]()
+							{
+								const FProceduralCurve* Curve = GetFirstRaw<FProceduralCurve>(Handle);
+								const bool bPreset = Curve && !ProceduralCurvePresets::FindMatchingName(*Curve).IsEmpty();
+								return bPreset ? FSlateColor::UseForeground() : FSlateColor::UseSubduedForeground();
+							})
+						]
+					]
+				]
+			]
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			[
+				MakeStepButton(Handle, 1)
+			];
+	}
 }
 
 #pragma region FProceduralCurveCustomization
@@ -133,7 +573,19 @@ void FProceduralCurveCustomization::CustomizeHeader(TSharedRef<IPropertyHandle> 
 		.ValueContent()
 		.MinDesiredWidth(220.0f)
 		[
-			MakePlot(MakeCurveSeries(PropertyHandle), 32.0f, 1.0f, false)
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot()
+			.FillWidth(1.0f)
+			[
+				MakePlot(MakeCurveSeries(PropertyHandle), 32.0f, 1.0f, false)
+			]
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.VAlign(VAlign_Center)
+			.Padding(4.0f, 0.0f, 0.0f, 0.0f)
+			[
+				MakePresetsButton(PropertyHandle)
+			]
 		];
 }
 
@@ -156,7 +608,7 @@ void FProceduralCurveCustomization::CustomizeChildren(TSharedRef<IPropertyHandle
 	{
 		if (const TSharedPtr<IPropertyHandle> Child = PropertyHandle->GetChildHandle(Index))
 		{
-			ChildBuilder.AddProperty(Child.ToSharedRef());
+			ChildBuilder.AddProperty(Child.ToSharedRef()).OverrideResetToDefault(MakeMemberResetOverride<FProceduralCurve>());
 		}
 	}
 }
@@ -340,12 +792,6 @@ void FProceduralCurveTermCustomization::CustomizeHeader(TSharedRef<IPropertyHand
 				.Font(IDetailLayoutBuilder::GetDetailFont())
 				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 			]
-			+ SHorizontalBox::Slot()
-			.AutoWidth()
-			.VAlign(VAlign_Center)
-			[
-				PropertyHandle->CreateDefaultPropertyButtonWidgets()
-			]
 		];
 }
 
@@ -374,7 +820,7 @@ void FProceduralCurveTermCustomization::CustomizeChildren(TSharedRef<IPropertyHa
 		{
 			continue;
 		}
-		ChildBuilder.AddProperty(Child.ToSharedRef());
+		ChildBuilder.AddProperty(Child.ToSharedRef()).OverrideResetToDefault(MakeMemberResetOverride<FProceduralCurveTerm>());
 	}
 
 	TSharedRef<FText> Error = MakeShared<FText>();
@@ -396,6 +842,7 @@ void FProceduralCurveTermCustomization::CustomizeChildren(TSharedRef<IPropertyHa
 			const FProceduralCurveTerm* Term = GetFirstRaw<FProceduralCurveTerm>(TermHandle);
 			return Term && Term->Waveform == EProceduralWaveform::Expression ? EVisibility::Visible : EVisibility::Collapsed;
 		}))
+		.OverrideResetToDefault(BindResetOverride(MakeMemberResetOverride<FProceduralCurveTerm>(), ExpressionHandle))
 		.NameContent()
 		[
 			ExpressionHandle->CreatePropertyNameWidget()
